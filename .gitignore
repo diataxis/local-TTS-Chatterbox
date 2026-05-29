@@ -1,0 +1,6 @@
+__pycache__/
+voices/my_voices/*
+!voices/my_voices/upload_voices_here
+models
+.DS_Store
+CLAUDE.md
