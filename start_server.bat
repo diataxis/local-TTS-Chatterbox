@@ -1,5 +1,5 @@
 @echo off
-set "CONDA_PATH=C:\ProgramData\miniconda3"
+set "CONDA_PATH=%USERPROFILE%\miniconda3"
 set "CONDA_ENV=chatterbox"
 
 cd /d "%~dp0"
