@@ -1,5 +1,7 @@
 import os
 import time
+import gc
+from collections import OrderedDict
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,12 +54,51 @@ else:
 
 print(f"Device: {device}")
 
-# Lazy-loaded model cache
-models = {}
+# Keep only the model in active use (best for memory-constrained / Apple Silicon).
+# Set CHATTERBOX_MAX_MODELS to N to keep an LRU of N models resident instead.
+MAX_MODELS = int(os.environ.get("CHATTERBOX_MAX_MODELS", "1"))
+
+# Lazy-loaded model cache (LRU-ordered)
+models = OrderedDict()
 
 # Voice embedding cache: avoids re-computing speaker embeddings for repeated voices.
 # Key = (model_type, abs_path, mtime), Value = model.conds (Conditionals dataclass)
-_voice_cache = {}
+# Bounded LRU so it can't grow without limit.
+_voice_cache = OrderedDict()
+_VOICE_CACHE_MAX = int(os.environ.get("CHATTERBOX_VOICE_CACHE", "16"))
+
+
+def _free_memory():
+    """Force Python GC + clear the device allocator cache."""
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    elif device == "mps":
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+
+def unload_model(model_type):
+    """Fully evict a model and release its memory."""
+    model = models.pop(model_type, None)
+    if model is None:
+        return
+
+    # Critical: drop voice-cache entries that reference this model's tensors,
+    # otherwise the memory stays pinned even after the model is gone.
+    for key in [k for k in _voice_cache if k[0] == model_type]:
+        del _voice_cache[key]
+
+    try:
+        model.to("cpu")  # move device tensors off GPU before freeing
+    except Exception:
+        pass
+    del model
+    _free_memory()
+    print(f"Unloaded {model_type} model")
 
 
 def _optimize_model(model, model_type):
@@ -103,28 +144,39 @@ def _optimize_model(model, model_type):
 
 
 def get_model(model_type="turbo"):
-    """Lazy-load, optimize, and cache Chatterbox models."""
-    if model_type not in models:
-        t0 = time.perf_counter()
-        if model_type == "turbo":
-            from chatterbox.tts_turbo import ChatterboxTurboTTS
-            models[model_type] = ChatterboxTurboTTS.from_pretrained(device=device)
-        elif model_type == "standard":
-            from chatterbox.tts import ChatterboxTTS
-            models[model_type] = ChatterboxTTS.from_pretrained(device=device)
-        elif model_type == "multilingual":
-            from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-            # Multilingual checkpoint was saved with CUDA tensors — patch
-            # torch.load to force map_location so it works on CPU/MPS.
-            _orig_load = torch.load
-            torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, "map_location": device})
-            try:
-                models[model_type] = ChatterboxMultilingualTTS.from_pretrained(device=device)
-            finally:
-                torch.load = _orig_load
-        load_time = time.perf_counter() - t0
-        print(f"Loaded Chatterbox {model_type} model on {device} ({load_time:.1f}s)")
-        _optimize_model(models[model_type], model_type)
+    """Lazy-load, optimize, and cache Chatterbox models (with LRU eviction)."""
+    if model_type in models:
+        models.move_to_end(model_type)  # mark as most-recently-used
+        return models[model_type]
+
+    # Evict least-recently-used models until there's room for the new one.
+    while len(models) >= MAX_MODELS:
+        oldest = next(iter(models))
+        unload_model(oldest)
+
+    t0 = time.perf_counter()
+    if model_type == "turbo":
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
+        models[model_type] = ChatterboxTurboTTS.from_pretrained(device=device)
+    elif model_type == "standard":
+        from chatterbox.tts import ChatterboxTTS
+        models[model_type] = ChatterboxTTS.from_pretrained(device=device)
+    elif model_type == "multilingual":
+        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+        # Multilingual checkpoint was saved with CUDA tensors — patch
+        # torch.load to force map_location so it works on CPU/MPS.
+        _orig_load = torch.load
+        torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, "map_location": device})
+        try:
+            models[model_type] = ChatterboxMultilingualTTS.from_pretrained(device=device)
+        finally:
+            torch.load = _orig_load
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+    load_time = time.perf_counter() - t0
+    print(f"Loaded Chatterbox {model_type} model on {device} ({load_time:.1f}s)")
+    _optimize_model(models[model_type], model_type)
     return models[model_type]
 
 
@@ -143,6 +195,7 @@ def _prepare_voice(model, model_type, audio_prompt_path):
 
     if cache_key in _voice_cache:
         model.conds = _voice_cache[cache_key]
+        _voice_cache.move_to_end(cache_key)  # mark as most-recently-used
         print(f"  Voice cache HIT: {os.path.basename(abs_path)}")
         return True
 
@@ -151,6 +204,12 @@ def _prepare_voice(model, model_type, audio_prompt_path):
     model.prepare_conditionals(abs_path)
     prep_time = time.perf_counter() - t0
     _voice_cache[cache_key] = model.conds
+    _voice_cache.move_to_end(cache_key)
+
+    # Bound the voice cache (drop oldest entries).
+    while len(_voice_cache) > _VOICE_CACHE_MAX:
+        _voice_cache.popitem(last=False)
+
     print(f"  Voice cache MISS: {os.path.basename(abs_path)} (computed in {prep_time:.2f}s, cached)")
     return True
 
@@ -300,8 +359,13 @@ async def preload_models():
     """Pre-load models at startup. Control via CHATTERBOX_PRELOAD env var (default: turbo)."""
     preload = os.environ.get("CHATTERBOX_PRELOAD", "turbo")
     if preload:
-        for model_type in preload.split(","):
-            model_type = model_type.strip()
-            if model_type:
-                print(f"Pre-loading {model_type} model...")
-                get_model(model_type)
+        requested = [m.strip() for m in preload.split(",") if m.strip()]
+        # Warn if you're asking to preload more models than will fit — they'd
+        # just evict each other immediately at startup.
+        if len(requested) > MAX_MODELS:
+            print(f"Warning: CHATTERBOX_PRELOAD lists {len(requested)} models but "
+                  f"CHATTERBOX_MAX_MODELS={MAX_MODELS}. Only the last {MAX_MODELS} "
+                  f"will remain resident.")
+        for model_type in requested:
+            print(f"Pre-loading {model_type} model...")
+            get_model(model_type)
